@@ -13,6 +13,7 @@ enum DebugLevels : uint32_t;
 }
 
 namespace FEXServerClient {
+
 enum class PacketType {
   // Request and Result
   TYPE_KILL,
