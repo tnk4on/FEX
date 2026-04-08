@@ -344,7 +344,7 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   ::memcpy(&header, MappedCacheFile, sizeof(header));
   MappedCacheFile += sizeof(header);
 
-  LogMan::Msg::IFmt("Cache load: {:5} blocks; base={:#14x}; off={:#9x}-{:#09x}; {:016x} {}", header.NumBlocks, BinarySection.FileStartVA,
+  LogMan::Msg::DFmt("Cache load: {:5} blocks; base={:#14x}; off={:#9x}-{:#09x}; {:016x} {}", header.NumBlocks, BinarySection.FileStartVA,
                     BinarySection.BeginVA - BinarySection.FileStartVA, BinarySection.EndVA - BinarySection.FileStartVA,
                     BinarySection.FileInfo.FileId, BinarySection.FileInfo.Filename);
 
@@ -354,14 +354,14 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
   }
 
   if (!ranges::equal(header.FEXVersion, GIT_HASH)) {
-    LogMan::Msg::IFmt("Cache generated from old FEX version {:02x}, current is {:02x}; skipping", fmt::join(header.FEXVersion, ""),
+    LogMan::Msg::DFmt("Cache generated from old FEX version {:02x}, current is {:02x}; skipping", fmt::join(header.FEXVersion, ""),
                       fmt::join(GIT_HASH, ""));
     return false;
   }
 
   if (header.NumBlocks == 0) {
     // Valid caches are never empty
-    LogMan::Msg::IFmt("Code cache empty, aborting");
+    LogMan::Msg::DFmt("Code cache empty, aborting");
     return false;
   }
 
@@ -387,11 +387,12 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
     auto [min_val, max_val] = ranges::minmax_element(BlockList, std::less {}, &decltype(BlockList)::value_type::first);
     auto MinBound = CTX.SyscallHandler->LookupExecutableFileSection(Thread, min_val->first + BinarySection.FileStartVA);
     auto MaxBound = CTX.SyscallHandler->LookupExecutableFileSection(Thread, max_val->first + BinarySection.FileStartVA);
-    if (&MinBound->FileInfo != &BinarySection.FileInfo || &MaxBound->FileInfo != &BinarySection.FileInfo) {
-      ERROR_AND_DIE_FMT("Cached blocks offsets {:#x}-{:#x} out of bounds for guest library {} ({:016x} @ {:#x}) while trying to load "
-                        "section {:#x}-{:#x}!",
+    if (!MinBound || !MaxBound || &MinBound->FileInfo != &BinarySection.FileInfo || &MaxBound->FileInfo != &BinarySection.FileInfo) {
+      LogMan::Msg::EFmt("Cached blocks offsets {:#x}-{:#x} out of bounds for guest library {} ({:016x} @ {:#x}) while trying to load "
+                        "section {:#x}-{:#x}; skipping cache",
                         min_val->first, max_val->first, BinarySection.FileInfo.Filename, BinarySection.FileInfo.FileId,
                         BinarySection.FileStartVA, BinarySection.BeginVA, BinarySection.EndVA);
+      return false;
     }
 
     // Constrain BlockList to the given ExecutableFileSectionInfo
@@ -401,7 +402,7 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
       ranges::upper_bound(begin, BlockList.end(), BinarySection.EndVA - BinarySection.FileStartVA - 1, std::less {}, &BlockListEntry::first);
     if (begin == end) {
       // Not an error since there is just no data to load
-      LogMan::Msg::IFmt("No blocks cached in this range, aborting");
+      LogMan::Msg::DFmt("No blocks cached in this range, aborting");
       return true;
     }
     BlockList.erase(end, BlockList.end());
@@ -435,7 +436,7 @@ bool CodeCache::LoadData(Core::InternalThreadState* Thread, std::byte* MappedCac
     if (Thread) {
       CTX.ClearCodeCache(Thread);
       CodeBuffer = CTX.GetLatest();
-      LogMan::Msg::IFmt("Increased code buffer size to {} MiB for cache load", CodeBuffer->AllocatedSize / 1024 / 1024);
+      LogMan::Msg::DFmt("Increased code buffer size to {} MiB for cache load", CodeBuffer->AllocatedSize / 1024 / 1024);
     } else {
       ERROR_AND_DIE_FMT("Cannot extend codebuffer without thread!");
     }
@@ -616,7 +617,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
   ValidationThread->LookupCache->ClearCache(ValidationThread->LookupCache->AcquireWriteLock());
   ValidationCTX->LatestOffset = 0;
 
-  LogMan::Msg::IFmt("\tSuccessfully validated cache");
+  LogMan::Msg::DFmt("\tSuccessfully validated cache");
 }
 
 bool CodeCache::ApplyCodeRelocations(uint64_t GuestEntry, std::span<std::byte> Code,

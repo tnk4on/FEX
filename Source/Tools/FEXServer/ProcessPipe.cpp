@@ -27,6 +27,7 @@
 #include <sys/wait.h>
 #include <vector>
 
+
 #include <xxhash.h>
 
 namespace FEXCore {
@@ -48,6 +49,7 @@ int ServerLockFD {-1};
 int WatchFD {-1};
 std::optional<fasio::tcp_acceptor> ServerAcceptor;
 std::optional<fasio::tcp_acceptor> ServerFSAcceptor;
+
 int NumClients = 0;
 time_t RequestTimeout {10};
 bool Foreground {false};
@@ -270,6 +272,7 @@ bool InitializeServerSocket(bool abstract) {
   (abstract ? ServerAcceptor : ServerFSAcceptor) = std::move(Acceptor).value();
   return true;
 }
+
 
 void SendEmptyErrorPacket(fasio::tcp_socket& Socket) {
   FEXServerClient::FEXServerResultPacket Res {
@@ -587,9 +590,43 @@ void HandleSocketData(fasio::tcp_socket& Socket) {
     case FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE:
     case FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK: {
       char Tmp[PATH_MAX];
-      int TmpLen = FEX::get_fdpath(inFD, Tmp);
-      assert(TmpLen != -1);
+      int TmpLen;
 
+      if (inFD != -1) {
+        // AF_UNIX path: fd was received via SCM_RIGHTS
+        TmpLen = FEX::get_fdpath(inFD, Tmp);
+        assert(TmpLen != -1);
+      } else if (buffer.size() >= sizeof(FEXServerClient::FEXServerVSockRequestPacket)) {
+        // AF_VSOCK path: path and PID were sent in the request packet
+        auto* VSockReq = reinterpret_cast<FEXServerClient::FEXServerVSockRequestPacket*>(Data.data());
+        // Reconstruct path via /proc/PID/root/ for cross-namespace access
+        TmpLen = snprintf(Tmp, sizeof(Tmp), "/proc/%d/root%s", VSockReq->ClientPID, VSockReq->BinaryPath);
+        if (TmpLen <= 0 || TmpLen >= (int)sizeof(Tmp)) {
+          SendEmptyErrorPacket(Socket);
+          buffer += sizeof(FEXServerClient::FEXServerVSockRequestPacket);
+          break;
+        }
+        // Open the binary via /proc/PID/root/
+        inFD = open(Tmp, O_RDONLY);
+        if (inFD < 0) {
+          fmt::print("VSOCK: Failed to open {} (errno {}): {}\n", Tmp, errno, strerror(errno));
+          SendEmptyErrorPacket(Socket);
+          buffer += sizeof(FEXServerClient::FEXServerVSockRequestPacket);
+          break;
+        }
+        // Re-resolve to get the actual binary path
+        TmpLen = FEX::get_fdpath(inFD, Tmp);
+        if (TmpLen == -1) {
+          close(inFD);
+          SendEmptyErrorPacket(Socket);
+          buffer += sizeof(FEXServerClient::FEXServerVSockRequestPacket);
+          break;
+        }
+      } else {
+        SendEmptyErrorPacket(Socket);
+        buffer += sizeof(FEXServerClient::FEXServerRequestPacket::Header);
+        break;
+      }
       std::filesystem::path Path {std::string_view(Tmp, TmpLen)};
       auto filename_hash = XXH3_64bits(Tmp, TmpLen);
       const bool HasMultiblock = (Req->Header.Type == FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE);
