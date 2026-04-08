@@ -144,7 +144,10 @@ void CodeMapWriter::AppendBlock(const FEXCore::ExecutableFileSectionInfo& Sectio
 
   BlockEntry -= SectionInfo.FileStartVA;
   if (BlockEntry > std::numeric_limits<uint32_t>::max()) {
-    ERROR_AND_DIE_FMT("Cannot write code map");
+    // Block offset exceeds uint32_t range — skip this entry.
+    // This can happen when an executable maps sections outside its program headers (e.g. Node.js).
+    LogMan::Msg::DFmt("Skipping code map entry: block offset {:#x} exceeds uint32 range for {}", BlockEntry, SectionInfo.FileInfo.Filename);
+    return;
   }
 
   // Register new library if not already known
