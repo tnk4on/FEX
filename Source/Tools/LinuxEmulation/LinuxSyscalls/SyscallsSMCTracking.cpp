@@ -238,7 +238,7 @@ static void LoadCodeCache(FEXCore::Core::InternalThreadState& Thread, FEXCore::E
                                           FEXCore::CodeMap::GetBaseFilename(Section.FileInfo, false), CodeCacheConfigId);
   int CacheFD = open(CacheFilename.c_str(), O_RDONLY);
   if (CacheFD == -1) {
-    LogMan::Msg::IFmt("Cache file does not exist: {}", CacheFilename);
+    LogMan::Msg::DFmt("Cache file does not exist: {}", CacheFilename);
     return;
   }
 
