@@ -27,7 +27,6 @@
 #include <sys/wait.h>
 #include <vector>
 
-
 #include <xxhash.h>
 
 namespace FEXCore {
@@ -53,6 +52,7 @@ std::optional<fasio::tcp_acceptor> ServerFSAcceptor;
 int NumClients = 0;
 time_t RequestTimeout {10};
 bool Foreground {false};
+bool VerboseCache {false};
 std::vector<struct pollfd> PollFDs {};
 
 // FD count watching
@@ -273,7 +273,6 @@ bool InitializeServerSocket(bool abstract) {
   return true;
 }
 
-
 void SendEmptyErrorPacket(fasio::tcp_socket& Socket) {
   FEXServerClient::FEXServerResultPacket Res {
     .Header {
@@ -318,13 +317,13 @@ ImportPendingCodeMaps(const FEXCore::ExecutableFileInfo& MainFileId, bool HasMul
     struct stat FileStats;
     fstat(FD, &FileStats);
     if (FileStats.st_size == 0 || flock(FD, LOCK_EX | LOCK_NB) != 0) {
-      fmt::print("Code map {} is still in use, skipping\n", CodeMap);
+      if (Foreground || VerboseCache) fmt::print("Code map {} is still in use, skipping\n", CodeMap);
       // Still being written to by a client process, so skip this file
       // TODO: Rename from X.n.bin to X.0.bin (once the latter has been removed!) to ensure we'll catch it on next run
       close(FD);
       continue;
     } else {
-      fmt::print("Found code map {}, queuing for merge\n", CodeMap);
+      if (Foreground || VerboseCache) fmt::print("Found code map {}, queuing for merge\n", CodeMap);
     }
     close(FD);
     CodeMaps.push_back(CodeMap);
@@ -333,7 +332,7 @@ ImportPendingCodeMaps(const FEXCore::ExecutableFileInfo& MainFileId, bool HasMul
   // Update merged code map
   std::map<FEXCore::ExecutableFileInfo, fextl::set<uintptr_t>> ImportedCodeMaps;
   if (!CodeMaps.empty()) {
-    fmt::print("Found {} new code maps, updating reference code map\n", CodeMaps.size());
+    if (Foreground || VerboseCache) fmt::print("Found {} new code maps, updating reference code map\n", CodeMaps.size());
 
     for (auto& CodeMap : CodeMaps) {
       std::ifstream Incoming(CodeMap, std::ios_base::binary);
@@ -359,7 +358,7 @@ ImportPendingCodeMaps(const FEXCore::ExecutableFileInfo& MainFileId, bool HasMul
  */
 static void WriteNewCodeMap(const FEXCore::ExecutableFileInfo& File, const std::string& OutputName, const fextl::set<uintptr_t>& Blocks,
                             bool IsMainFile, const auto& Dependencies) {
-  fmt::print("Writing {} blocks to {}\n", Blocks.size(), OutputName);
+  if (Foreground || VerboseCache) fmt::print("Writing {} blocks to {}\n", Blocks.size(), OutputName);
 
   struct CodeMapOpener : FEXCore::CodeMapOpener {
     CodeMapOpener(const std::string& Filename) {
@@ -439,7 +438,7 @@ static std::map<FEXCore::ExecutableFileInfo, NeedsCacheRefresh> AggregateCodeMap
         // No new blocks => no need to regenerate the corresponding cache
         continue;
       } else {
-        fmt::println("  Found {} new blocks ({} total) in code map {} for {}", Blocks.size(), NumPreviousBlocks, BinaryName, File.Filename);
+        if (Foreground || VerboseCache) fmt::println("  Found {} new blocks ({} total) in code map {} for {}", Blocks.size(), NumPreviousBlocks, BinaryName, File.Filename);
       }
     }
 
@@ -455,6 +454,15 @@ static std::map<FEXCore::ExecutableFileInfo, NeedsCacheRefresh> AggregateCodeMap
 int32_t EmbedSubprocess(const char* path, char* const* args) {
   pid_t pid = fork();
   if (pid == 0) {
+    // Suppress FEXOfflineCompiler stdout/stderr in background mode
+    if (!Foreground && !VerboseCache) {
+      int devnull = open("/dev/null", O_WRONLY);
+      if (devnull >= 0) {
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+      }
+    }
     execvp(path, args);
     _exit(-1);
   } else {
@@ -590,49 +598,20 @@ void HandleSocketData(fasio::tcp_socket& Socket) {
     case FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE:
     case FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK: {
       char Tmp[PATH_MAX];
-      int TmpLen;
-
-      if (inFD != -1) {
-        // AF_UNIX path: fd was received via SCM_RIGHTS
-        TmpLen = FEX::get_fdpath(inFD, Tmp);
-        assert(TmpLen != -1);
-      } else if (buffer.size() >= sizeof(FEXServerClient::FEXServerVSockRequestPacket)) {
-        // AF_VSOCK path: path and PID were sent in the request packet
-        auto* VSockReq = reinterpret_cast<FEXServerClient::FEXServerVSockRequestPacket*>(Data.data());
-        // Reconstruct path via /proc/PID/root/ for cross-namespace access
-        TmpLen = snprintf(Tmp, sizeof(Tmp), "/proc/%d/root%s", VSockReq->ClientPID, VSockReq->BinaryPath);
-        if (TmpLen <= 0 || TmpLen >= (int)sizeof(Tmp)) {
-          SendEmptyErrorPacket(Socket);
-          buffer += sizeof(FEXServerClient::FEXServerVSockRequestPacket);
-          break;
-        }
-        // Open the binary via /proc/PID/root/
-        inFD = open(Tmp, O_RDONLY);
-        if (inFD < 0) {
-          fmt::print("VSOCK: Failed to open {} (errno {}): {}\n", Tmp, errno, strerror(errno));
-          SendEmptyErrorPacket(Socket);
-          buffer += sizeof(FEXServerClient::FEXServerVSockRequestPacket);
-          break;
-        }
-        // Re-resolve to get the actual binary path
-        TmpLen = FEX::get_fdpath(inFD, Tmp);
-        if (TmpLen == -1) {
-          close(inFD);
-          SendEmptyErrorPacket(Socket);
-          buffer += sizeof(FEXServerClient::FEXServerVSockRequestPacket);
-          break;
-        }
-      } else {
+      if (inFD == -1) {
         SendEmptyErrorPacket(Socket);
         buffer += sizeof(FEXServerClient::FEXServerRequestPacket::Header);
         break;
       }
+      int TmpLen = FEX::get_fdpath(inFD, Tmp);
+      assert(TmpLen != -1);
+
       std::filesystem::path Path {std::string_view(Tmp, TmpLen)};
       auto filename_hash = XXH3_64bits(Tmp, TmpLen);
       const bool HasMultiblock = (Req->Header.Type == FEXServerClient::PacketType::TYPE_POPULATE_CODE_CACHE);
 
       FEXCore::ExecutableFileInfo MainFileId = {nullptr, filename_hash, fextl::string(Tmp, TmpLen)};
-      fmt::print("Requested {}cache generation for {}\n", HasMultiblock ? "" : "nomb-", MainFileId.Filename);
+      if (Foreground || VerboseCache) fmt::print("Requested {}cache generation for {}\n", HasMultiblock ? "" : "nomb-", MainFileId.Filename);
 
       auto GetCacheFilename = [](const FEXCore::ExecutableFileInfo& FileId) {
         return fmt::format("{}cache/{}-{:016x}", FEX::Config::GetCacheDirectory(), FEXCore::CodeMap::GetBaseFilename(FileId, false),
@@ -655,7 +634,7 @@ void HandleSocketData(fasio::tcp_socket& Socket) {
         const auto MergedCodeMapFilename = fmt::format("{}/{}", ReadyCodeMapDirectory, BinaryName);
         const auto LastCodeMapUpdate = std::filesystem::last_write_time(MergedCodeMapFilename, ec);
         if (std::filesystem::last_write_time(GetCacheFilename(FileInfo), ec) < LastCodeMapUpdate || ec) {
-          fmt::println("  Scheduling update for {} cache for {}", ec ? "missing" : "outdated", BinaryName);
+          if (Foreground || VerboseCache) fmt::println("  Scheduling update for {} cache for {}", ec ? "missing" : "outdated", BinaryName);
           NeedsRefresh = NeedsCacheRefresh::Yes;
         }
       }
@@ -667,10 +646,10 @@ void HandleSocketData(fasio::tcp_socket& Socket) {
         }
 
         const auto BinaryName = (std::string)FEXCore::CodeMap::GetBaseFilename(File, !HasMultiblock);
-        fmt::println("Generating cache for {}", BinaryName);
+        if (Foreground || VerboseCache) fmt::println("Generating cache for {}", BinaryName);
         int Status = RunOfflineCompiler(fmt::format("{}/{}", ReadyCodeMapDirectory, BinaryName).c_str());
         if (Status != 0) {
-          fmt::println("ERROR: Cache generation failed with status {}", Status);
+          LogMan::Msg::EFmt("Cache generation failed with status {}", Status);
         }
       }
 
@@ -798,6 +777,8 @@ void WaitForRequests() {
 
 void SetConfiguration(bool Foreground, uint32_t PersistentTimeout) {
   ProcessPipe::Foreground = Foreground;
+  const char* verbose = getenv("FEX_VERBOSE_CACHE");
+  ProcessPipe::VerboseCache = (verbose != nullptr && verbose[0] == '1');
   ProcessPipe::RequestTimeout = PersistentTimeout;
 
   NewCodeMapDirectory = FEX::Config::GetCacheDirectory() + "codemap/new";
