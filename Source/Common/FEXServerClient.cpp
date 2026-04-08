@@ -29,6 +29,7 @@
 #include <cstring>
 
 namespace FEXServerClient {
+
 Logging::PacketHeader Logging::FillHeader(PacketTypes Type) {
   Logging::PacketHeader Msg {
     .PacketType = Type,
@@ -194,7 +195,7 @@ int ConnectToServer(ConnectionOption ConnectionOption) {
 
   if (connect(SocketFD, reinterpret_cast<struct sockaddr*>(&addr), SizeOfAddr) == -1) {
     if (ConnectionOption == ConnectionOption::Default || errno != ECONNREFUSED) {
-      LogMan::Msg::EFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketName, errno);
+      LogMan::Msg::DFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketName, errno);
     }
   } else {
     return SocketFD;
@@ -211,13 +212,14 @@ int ConnectToServer(ConnectionOption ConnectionOption) {
   SizeOfAddr = sizeof(addr.sun_family) + SizeOfSocketString;
   if (connect(SocketFD, reinterpret_cast<struct sockaddr*>(&addr), SizeOfAddr) == -1) {
     if (ConnectionOption == ConnectionOption::Default || (errno != ECONNREFUSED && errno != ENOENT)) {
-      LogMan::Msg::EFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketPath, errno);
+      LogMan::Msg::DFmt("Couldn't connect to FEXServer socket {} {}", ServerSocketPath, errno);
     }
   } else {
     return SocketFD;
   }
 
   close(SocketFD);
+
   return -1;
 }
 
@@ -330,8 +332,10 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
       return -1;
     }
 
-    for (size_t i = 0; i < 5; ++i) {
-      LocalServerFD = ConnectToServer(ConnectionOption::Default);
+    // Reduce retries from 5 to 2 to minimize startup delay in containers
+    // where FEXServer may legitimately fail to bind sockets.
+    for (size_t i = 0; i < 2; ++i) {
+      LocalServerFD = ConnectToServer(ConnectionOption::NoPrintConnectionError);
 
       if (LocalServerFD != -1) {
         break;
@@ -342,7 +346,7 @@ int StartServer(std::string_view InterpreterPath, int watch_fd) {
 
     if (LocalServerFD == -1) {
       // Still couldn't connect to the socket.
-      LogMan::Msg::EFmt("Couldn't connect to FEXServer socket after launching the process");
+      LogMan::Msg::DFmt("Couldn't connect to FEXServer socket after launching the process");
     }
   }
 
@@ -409,20 +413,18 @@ void PopulateCodeCache(int ServerSocket, int ProgramFD, bool HasMultiblock) {
   fasio::error ec;
   fasio::tcp_socket Socket {ServerSocket};
 
-  // Send request
   FEXServerRequestPacket Req {
     .Header {.Type = HasMultiblock ? PacketType::TYPE_POPULATE_CODE_CACHE : PacketType::TYPE_POPULATE_CODE_CACHE_NO_MULTIBLOCK}};
 
   fasio::mutable_buffer WriteBuffer {std::as_writable_bytes(std::span {&Req, 1})};
   WriteBuffer.FD = &ProgramFD;
   write(Socket, WriteBuffer, ec);
+
   if (ec != fasio::error::success) {
     return;
   }
 
   // Wait for success response to ensure FEXServer completed any pending cache generation.
-  // The cache loading code handles missing caches gracefully, so we don't
-  // actually care about the result here.
   FEXServerResultPacket Res {};
   fasio::mutable_buffer ResBuffer {std::as_writable_bytes(std::span {&Res, 1})};
   read(Socket, ResBuffer, ec);
